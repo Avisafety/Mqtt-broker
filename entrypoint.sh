@@ -8,6 +8,6 @@ if [ ! -f /mosquitto/data/passwd ]; then
 fi
 
 chown -R mosquitto:mosquitto /mosquitto/data
-chmod 644 /mosquitto/data/passwd
+chmod 700 /mosquitto/data/passwd
 
 exec mosquitto -c /mosquitto/config/mosquitto.conf
