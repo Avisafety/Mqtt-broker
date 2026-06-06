@@ -1,14 +1,16 @@
 app = "mqtt-broker-tdi40g"
+primary_region = "ams"
 
 [build]
+  dockerfile = "Dockerfile"
 
 [[services]]
   protocol = "tcp"
   internal_port = 1883
 
   [[services.ports]]
-    handlers = []
     port = 1883
+    handlers = []
 
 [[vm]]
   memory = "256mb"
