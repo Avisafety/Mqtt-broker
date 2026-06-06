@@ -3,7 +3,7 @@ app = "mqtt-broker"
 [build]
 
 [[services]]
-  internal_port = 1883
+  internal_port = 8080
   protocol = "tcp"
 
   [[services.ports]]
