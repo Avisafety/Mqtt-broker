@@ -9,6 +9,10 @@ primary_region = "ams"
     port = 1883
     handlers = []
 
+  [[services.ports]]
+    port = 8883
+    handlers = ["tls"]
+
 [[vm]]
   memory = "256mb"
   cpu_kind = "shared"
