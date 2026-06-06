@@ -1,0 +1,15 @@
+app = "mqtt-avisafe"
+
+[build]
+
+[[services]]
+  internal_port = 1883
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 1883
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
