@@ -1,4 +1,4 @@
-app = "Mqtt-broker"
+app = "mqtt-broker"
 
 [build]
 
