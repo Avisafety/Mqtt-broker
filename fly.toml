@@ -1,4 +1,4 @@
-app = "mqtt-broker-tdi40g"
+app = "mqtt-broker-avisafe"
 primary_region = "ams"
 
 [build]
