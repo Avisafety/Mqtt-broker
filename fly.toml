@@ -3,10 +3,11 @@ app = "mqtt-broker-tdi40g"
 [build]
 
 [[services]]
-  internal_port = 1883
   protocol = "tcp"
+  internal_port = 1883
 
   [[services.ports]]
+    handlers = []
     port = 1883
 
 [[vm]]
