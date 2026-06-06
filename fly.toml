@@ -1,4 +1,4 @@
-app = "mqtt-broker"
+app = "mqtt-broker-tdi40g"
 
 [build]
 
