@@ -1,9 +1,14 @@
 app = "mqtt-broker-avisafe"
 primary_region = "ams"
 
+[processes]
+  mosquitto = "/entrypoint.sh"
+  bridge = "python3 /app/bridge.py"
+
 [[services]]
   protocol = "tcp"
   internal_port = 1883
+  processes = ["mosquitto"]
 
   [[services.ports]]
     port = 1883
