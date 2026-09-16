@@ -25,7 +25,7 @@ import paho.mqtt.client as mqtt
 import requests
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(message)s",
 )
@@ -40,12 +40,54 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 
 ORDER_ID = "dji-cloud"
-DRONE_CACHE_TTL = 300  # seconds
+# Negative lookups are cached only briefly so a newly registered drone starts
+# working within seconds instead of minutes.
+DRONE_CACHE_TTL = 300  # seconds (successful lookups)
+DRONE_NEGATIVE_CACHE_TTL = 30  # seconds (serial number not found)
+STATS_INTERVAL = 60  # seconds between summary lines
 
 # sn -> (expires_at, {"drone_id": ..., "company_id": ...} | None)
 _drone_cache = {}
 # sn -> number of dropped messages because the sn is unknown
 _dropped_counts = {}
+# sn -> counters, plus the last payload seen for unresolved serials
+_stats = {}
+_unresolved_samples = {}
+_stored_once = set()
+_last_stats_at = 0.0
+
+
+def _bump(sn, key):
+    row = _stats.setdefault(sn, {"received": 0, "stored": 0, "dropped": 0, "failed": 0})
+    row[key] += 1
+
+
+def maybe_print_stats():
+    """Print a short summary line per serial number every STATS_INTERVAL."""
+    global _last_stats_at
+    now = time.time()
+    if now - _last_stats_at < STATS_INTERVAL:
+        return
+    _last_stats_at = now
+    if not _stats:
+        log.info("status: no messages received in the last %ds", STATS_INTERVAL)
+        return
+    for sn, row in _stats.items():
+        log.info(
+            "status sn=%s received=%d stored=%d dropped_unknown_sn=%d write_failed=%d",
+            sn,
+            row["received"],
+            row["stored"],
+            row["dropped"],
+            row["failed"],
+        )
+    for sn, sample in _unresolved_samples.items():
+        log.warning(
+            "status unresolved_sn=%s sample_position=%s "
+            "(register this serial number on a drone in AviSafe)",
+            sn,
+            json.dumps(sample),
+        )
 
 session = requests.Session()
 
@@ -73,7 +115,8 @@ def resolve_drone(sn):
         resp = session.get(
             SUPABASE_URL + "/rest/v1/drones",
             params={
-                "serienummer": "eq." + sn,
+                # Match on either the external serial number or the internal one
+                "or": "(serienummer.eq.{0},internal_serial.eq.{0})".format(sn),
                 "select": "id,company_id",
                 "limit": "1",
             },
@@ -85,13 +128,21 @@ def resolve_drone(sn):
             if rows:
                 result = {"drone_id": rows[0]["id"], "company_id": rows[0]["company_id"]}
         else:
-            log.error("drone lookup failed for %s: %s %s", sn, resp.status_code, resp.text[:300])
+            log.error(
+                "drone lookup DATABASE_ERROR sn=%s status=%s body=%s",
+                sn,
+                resp.status_code,
+                resp.text[:300],
+            )
             return None  # transient failure: do not cache
     except Exception as exc:  # noqa: BLE001
-        log.error("drone lookup error for %s: %s", sn, exc)
+        log.error("drone lookup NETWORK_ERROR sn=%s error=%s", sn, exc)
         return None
 
-    _drone_cache[sn] = (now + DRONE_CACHE_TTL, result)
+    ttl = DRONE_CACHE_TTL if result else DRONE_NEGATIVE_CACHE_TTL
+    _drone_cache[sn] = (now + ttl, result)
+    if result:
+        log.info("resolved sn=%s drone_id=%s company_id=%s", sn, result["drone_id"], result["company_id"])
     return result
 
 
@@ -147,13 +198,25 @@ def handle_osd(sn_from_topic, payload):
         log.warning("OSD message without gateway/sn, skipping")
         return
 
+    _bump(sn, "received")
+    log.debug("OSD sn=%s payload=%s", sn, json.dumps(payload))
+
     lat = num(data.get("latitude"))
     lng = num(data.get("longitude"))
     if lat is None or lng is None:
+        log.debug("OSD sn=%s has no position fields, skipping", sn)
         return  # no position in this OSD frame
 
     drone = resolve_drone(sn)
     if not drone:
+        _bump(sn, "dropped")
+        _unresolved_samples[sn] = {
+            "sn": sn,
+            "lat": lat,
+            "lng": lng,
+            "height": num(data.get("height")),
+            "battery_percent": num(data.get("capacity_percent")),
+        }
         note_unresolved(sn)
         return
 
@@ -177,15 +240,38 @@ def handle_osd(sn_from_topic, payload):
 
     try:
         resp = session.post(
-            SUPABASE_URL + "/rest/v1/flighthub2_positions",
-            headers=supabase_headers({"Prefer": "return=minimal"}),
+            SUPABASE_URL + "/rest/v1/flighthub2_positions?on_conflict=sn",
+            headers=supabase_headers(
+                {"Prefer": "resolution=merge-duplicates,return=minimal"}
+            ),
             data=json.dumps(row),
             timeout=10,
         )
         if resp.status_code >= 300:
-            log.error("insert failed for %s: %s %s", sn, resp.status_code, resp.text[:300])
+            _bump(sn, "failed")
+            log.error(
+                "write DATABASE_ERROR sn=%s status=%s body=%s row=%s",
+                sn,
+                resp.status_code,
+                resp.text[:300],
+                json.dumps({k: v for k, v in row.items() if k != "raw"}),
+            )
+        else:
+            _bump(sn, "stored")
+            _unresolved_samples.pop(sn, None)
+            if sn not in _stored_once:
+                _stored_once.add(sn)
+                log.info(
+                    "first position stored sn=%s lat=%s lng=%s height=%s",
+                    sn,
+                    lat,
+                    lng,
+                    height,
+                )
+            log.debug("stored sn=%s lat=%s lng=%s height=%s", sn, lat, lng, height)
     except Exception as exc:  # noqa: BLE001
-        log.error("insert error for %s: %s", sn, exc)
+        _bump(sn, "failed")
+        log.error("write NETWORK_ERROR sn=%s error=%s", sn, exc)
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -221,6 +307,8 @@ def on_message(client, userdata, msg):
             handle_osd(sn, payload)
     except Exception as exc:  # noqa: BLE001
         log.exception("error handling message on %s: %s", msg.topic, exc)
+
+    maybe_print_stats()
 
 
 def main():
