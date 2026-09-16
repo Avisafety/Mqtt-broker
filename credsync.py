@@ -37,6 +37,7 @@ SECRET = os.environ.get("MQTT_BROKER_API_SECRET") or ""
 INTERVAL = int(os.environ.get("CRED_SYNC_INTERVAL", "60"))
 
 PASSWD_FILE = "/mosquitto/data/passwd"
+PASSWD_TMP = "/mosquitto/data/passwd.tmp"
 ACL_FILE = "/mosquitto/data/acl"
 
 _last_hash = None
@@ -57,26 +58,51 @@ def fetch():
 
 
 def write_passwd(creds):
-    # The internal bridge user is always written first (-c resets the file),
-    # then one entry per company credential set.
+    """Rebuild the whole password file from scratch, then swap it in atomically.
+
+    Rebuilding (instead of appending) means credentials disabled in AviSafe
+    actually disappear from the file. `-c` is never used on the live file: it
+    fails on every run after the first ("File exists").
+    """
+    # The shared/internal user is written explicitly - it is still in active use.
     entries = [
         (os.environ.get("MQTT_USERNAME", ""), os.environ.get("MQTT_PASSWORD", "")),
     ] + [(c["username"], c["password"]) for c in creds]
 
-    first = True
+    if os.path.exists(PASSWD_TMP):
+        os.remove(PASSWD_TMP)
+    # Create an empty temp file; mosquitto_passwd -b appends to an existing file.
+    with open(PASSWD_TMP, "w"):
+        pass
+    os.chmod(PASSWD_TMP, 0o600)
+
     written = []
     for username, password in entries:
         if not username or not password:
             continue
-        args = ["mosquitto_passwd", "-b"]
-        if first:
-            args.append("-c")
-            first = False
-        args += [PASSWD_FILE, username, password]
-        subprocess.run(args, check=True)
+        subprocess.run(
+            ["mosquitto_passwd", "-b", PASSWD_TMP, username, password], check=True
+        )
         written.append(username)
+
+    log.info(
+        "passwd rebuild: %d users staged in %s: %s",
+        len(written),
+        PASSWD_TMP,
+        ", ".join(written),
+    )
+
+    os.replace(PASSWD_TMP, PASSWD_FILE)
     os.chmod(PASSWD_FILE, 0o600)
-    log.info("passwd written with %d users: %s", len(written), ", ".join(written))
+
+    try:
+        with open(PASSWD_FILE) as fh:
+            live = [line for line in fh.read().splitlines() if line.strip()]
+        log.info("passwd swapped in: %d lines now live", len(live))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not verify passwd file after swap: %s", exc)
+
+
 
 
 def write_acl(creds):
