@@ -18,6 +18,8 @@ import hashlib
 import json
 import logging
 import os
+import pwd
+import shutil
 import signal
 import subprocess
 import sys
@@ -38,7 +40,12 @@ INTERVAL = int(os.environ.get("CRED_SYNC_INTERVAL", "60"))
 
 PASSWD_FILE = "/mosquitto/data/passwd"
 PASSWD_TMP = "/mosquitto/data/passwd.tmp"
+PASSWD_BACKUP = "/mosquitto/data/passwd.previous"
 ACL_FILE = "/mosquitto/data/acl"
+ACL_TMP = "/mosquitto/data/acl.tmp"
+ACL_BACKUP = "/mosquitto/data/acl.previous"
+MOSQUITTO_UID = pwd.getpwnam("mosquitto").pw_uid
+MOSQUITTO_GID = pwd.getpwnam("mosquitto").pw_gid
 
 _last_hash = None
 
@@ -85,6 +92,9 @@ def write_passwd(creds):
         )
         written.append(username)
 
+    with open(PASSWD_TMP, "rb") as fh:
+        os.fsync(fh.fileno())
+
     log.info(
         "passwd rebuild: %d users staged in %s: %s",
         len(written),
@@ -92,17 +102,12 @@ def write_passwd(creds):
         ", ".join(written),
     )
 
-    os.replace(PASSWD_TMP, PASSWD_FILE)
-    os.chmod(PASSWD_FILE, 0o600)
-
-    try:
-        with open(PASSWD_FILE) as fh:
-            live = [line for line in fh.read().splitlines() if line.strip()]
-        log.info("passwd swapped in: %d lines now live", len(live))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not verify passwd file after swap: %s", exc)
-
-
+    # mosquitto drops privileges to its own user. A root-owned 0600 file looks
+    # valid to credsync but cannot be reopened by mosquitto during SIGHUP.
+    live = _install_verified_file(
+        PASSWD_TMP, PASSWD_FILE, PASSWD_BACKUP, "password file"
+    )
+    log.info("passwd swapped in: %d lines now live", live)
 
 
 def write_acl(creds):
@@ -126,19 +131,88 @@ def write_acl(creds):
             len(c.get("serial_numbers", [])),
             len(c.get("company_ids", [])),
         )
-    with open(ACL_FILE, "w") as fh:
+    with open(ACL_TMP, "w") as fh:
         fh.write("\n".join(lines) + "\n")
-    os.chmod(ACL_FILE, 0o600)
+        fh.flush()
+        os.fsync(fh.fileno())
+    _install_verified_file(ACL_TMP, ACL_FILE, ACL_BACKUP, "ACL file")
+
+
+def _install_verified_file(staged_path, live_path, backup_path, label):
+    """Install a staged auth file and restore the old one on any failure."""
+    had_live_file = os.path.isfile(live_path) and os.path.getsize(live_path) > 0
+    if had_live_file:
+        shutil.copy2(live_path, backup_path)
+        os.chown(backup_path, MOSQUITTO_UID, MOSQUITTO_GID)
+        os.chmod(backup_path, 0o600)
+
+    try:
+        os.chown(staged_path, MOSQUITTO_UID, MOSQUITTO_GID)
+        os.chmod(staged_path, 0o600)
+        os.replace(staged_path, live_path)
+        os.chown(live_path, MOSQUITTO_UID, MOSQUITTO_GID)
+        os.chmod(live_path, 0o600)
+        _sync_directory(live_path)
+        return _verify_file(live_path, label)
+    except Exception:
+        if had_live_file and os.path.isfile(backup_path):
+            os.replace(backup_path, live_path)
+            os.chown(live_path, MOSQUITTO_UID, MOSQUITTO_GID)
+            os.chmod(live_path, 0o600)
+            _sync_directory(live_path)
+            log.error("%s update failed; restored previous live file", label)
+        raise
+    finally:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+
+def _sync_directory(path):
+    """Flush a renamed directory entry before mosquitto is asked to reload."""
+    directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _verify_file(path, label):
+    """Require a stable, non-empty file readable by the mosquitto user."""
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        raise RuntimeError(f"{label} is missing or empty after swap: {path}")
+
+    stat_result = os.stat(path)
+    if stat_result.st_uid != MOSQUITTO_UID or stat_result.st_gid != MOSQUITTO_GID:
+        raise RuntimeError(f"{label} has incorrect owner after swap: {path}")
+
+    with open(path, "rb") as fh:
+        content = fh.read()
+    if not content.strip():
+        raise RuntimeError(f"{label} contains no usable data after swap: {path}")
+    return len([line for line in content.splitlines() if line.strip()])
+
+
+def auth_files_ready():
+    _verify_file(PASSWD_FILE, "password file")
+    _verify_file(ACL_FILE, "ACL file")
 
 
 def reload_mosquitto():
-    try:
-        out = subprocess.run(["pgrep", "mosquitto"], capture_output=True, text=True)
-        for pid in out.stdout.split():
-            os.kill(int(pid), signal.SIGHUP)
-            log.info("sent SIGHUP to mosquitto pid=%s", pid)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not reload mosquitto: %s", exc)
+    # Fly volumes may expose a just-renamed directory entry with a short delay.
+    # Validate twice and never signal mosquitto if either check fails.
+    auth_files_ready()
+    time.sleep(0.1)
+    auth_files_ready()
+
+    out = subprocess.run(
+        ["pgrep", "mosquitto"], capture_output=True, text=True, check=False
+    )
+    pids = out.stdout.split()
+    if not pids:
+        raise RuntimeError("no running mosquitto process found; SIGHUP not sent")
+    for pid in pids:
+        os.kill(int(pid), signal.SIGHUP)
+        log.info("sent SIGHUP to mosquitto pid=%s after two successful file checks", pid)
 
 
 def sync_once():
@@ -158,9 +232,15 @@ def sync_once():
     if not creds:
         log.warning("credential feed returned 0 active sets - keeping current files")
         return
-    write_passwd(creds)
-    write_acl(creds)
-    reload_mosquitto()
+    try:
+        write_passwd(creds)
+        write_acl(creds)
+        reload_mosquitto()
+    except Exception as exc:  # noqa: BLE001
+        # Most importantly, do not send SIGHUP after a failed write/validation.
+        # Mosquitto keeps serving with the credentials already loaded in memory.
+        log.error("credential reload aborted; mosquitto was left running: %s", exc)
+        return
     _last_hash = digest
     log.info("applied %d credential sets", len(creds))
 
