@@ -19,10 +19,8 @@ chown -R mosquitto:mosquitto /mosquitto/data
 chmod 600 /mosquitto/data/passwd /mosquitto/data/acl
 
 # Keep company credentials + per-serial ACLs in sync in the background.
-if [ -n "$AVISAFE_CREDENTIALS_URL" ] && [ -n "$MQTT_BROKER_API_SECRET" ]; then
-  python3 /app/credsync.py &
-else
-  echo "credsync disabled: AVISAFE_CREDENTIALS_URL / MQTT_BROKER_API_SECRET not set"
-fi
+# Always started: when it is not configured it keeps logging an "ADVARSEL:" line
+# on every attempt instead of a single startup message that drowns in the log.
+python3 -u /app/credsync.py &
 
 exec mosquitto -c /mosquitto/config/mosquitto.conf

@@ -5,11 +5,25 @@ primary_region = "ams"
   mosquitto = "/entrypoint.sh"
   bridge = "python3 /app/bridge.py"
 
+[env]
+  # Fly kjører hver prosess i egen maskin. `<app>.internal` løser til ALLE
+  # maskiner i appen (også bru-maskinen, som ikke lytter) -> "Connection
+  # refused". Prosessgruppe-DNS treffer kun mosquitto-maskinene.
+  MQTT_BRIDGE_HOST = "mosquitto.process.mqtt-broker-avisafe.internal"
+  MQTT_BRIDGE_PORT = "1883"
+
 [[services]]
   protocol = "tcp"
   internal_port = 1883
   processes = ["mosquitto"]
 
+  # SIKKERHETSMERKNAD - IKKE FJERN:
+  # Port 1883 eksponeres uten TLS-handler (ren TCP passthrough) fordi DJI
+  # FlightHub 2 sin "Configure Telemetry Data"/Sync kun støtter ren TCP.
+  # På denne porten går brukernavn, passord og posisjonsdata i klartekst over
+  # åpent internett. Dette er en bevisst avveining. Autentisering (passwd-fil)
+  # og ACL i mosquitto gjelder likt her som på 8883 - kun transportkrypteringen
+  # droppes. Direkte Pilot 2 / djiBridge skal bruke 8883 (TLS).
   [[services.ports]]
     port = 1883
     handlers = []

@@ -8,7 +8,11 @@ Runs alongside mosquitto in the same Fly app. Responsibilities:
 
 Configuration comes from environment variables / Fly secrets:
   MQTT_USERNAME, MQTT_PASSWORD          - same credentials mosquitto uses
-  MQTT_BRIDGE_HOST (optional)           - default mqtt-broker-avisafe.internal
+  MQTT_BRIDGE_HOST (optional)           - default
+                                          mosquitto.process.mqtt-broker-avisafe.internal
+                                          (app-wide .internal resolves to every
+                                          machine, including this one, which has
+                                          no listener -> connection refused)
   MQTT_BRIDGE_PORT (optional)           - default 1883
   SUPABASE_URL                          - main AviSafe project URL
   SUPABASE_SERVICE_ROLE_KEY             - service role key for that project
@@ -31,7 +35,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("dji-bridge")
 
-MQTT_HOST = os.environ.get("MQTT_BRIDGE_HOST", "mqtt-broker-avisafe.internal")
+MQTT_HOST = os.environ.get(
+    "MQTT_BRIDGE_HOST", "mosquitto.process.mqtt-broker-avisafe.internal"
+)
 MQTT_PORT = int(os.environ.get("MQTT_BRIDGE_PORT", "1883"))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")

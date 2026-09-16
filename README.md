@@ -12,7 +12,22 @@ telemetri inn i AviSafe-databasen.
 | `bridge` | `python3 /app/bridge.py` | Kobler til brokeren over Flys interne nett, acker handshake, skriver posisjoner. |
 
 Fly kjører hver prosess i egen maskin, så bridgen kobler til
-`mqtt-broker-avisafe.internal:1883` (ikke `localhost`).
+`mosquitto.process.mqtt-broker-avisafe.internal:1883` (ikke `localhost`, og
+ikke `mqtt-broker-avisafe.internal` – app-DNS-navnet løser til *alle* maskiner,
+også bru-maskinen som ikke lytter, og gir «Connection refused» i loop).
+
+## Porter
+
+| Port | Transport | Brukes av |
+|---|---|---|
+| 1883 | ren TCP, **ingen TLS** | DJI FlightHub 2 «Configure Telemetry Data»/Sync |
+| 8883 | TLS (terminert i Fly sin edge) | Direkte Pilot 2 / `djiBridge` via `/dji` |
+
+**SIKKERHETSMERKNAD – ikke fjern:** på 1883 går brukernavn, passord og
+posisjonsdata i klartekst over åpent internett. Dette er en bevisst avveining
+fordi DJI FlightHub Sync ikke støtter TLS. Mosquitto krever fortsatt
+autentisering (passwd-fil) og håndhever ACL på denne porten akkurat som på
+8883 – kun transportkrypteringen droppes.
 
 ## Secrets
 
@@ -23,8 +38,9 @@ fly secrets set SUPABASE_SERVICE_ROLE_KEY=...
 fly secrets set AVISAFE_CREDENTIALS_URL=https://<ref>.functions.supabase.co/mqtt-broker-credentials
 fly secrets set MQTT_BROKER_API_SECRET=...                 # samme verdi som i Supabase
 # valgfritt
-fly secrets set MQTT_BRIDGE_HOST=mqtt-broker-avisafe.internal MQTT_BRIDGE_PORT=1883
-fly secrets set CRED_SYNC_INTERVAL=300 LOG_LEVEL=DEBUG
+# valgfritt (satt som default i fly.toml [env])
+fly secrets set MQTT_BRIDGE_HOST=mosquitto.process.mqtt-broker-avisafe.internal MQTT_BRIDGE_PORT=1883
+fly secrets set CRED_SYNC_INTERVAL=60 LOG_LEVEL=DEBUG
 ```
 
 MQTT_USERNAME / MQTT_PASSWORD brukes nå kun av brua internt – kundene har egne
@@ -36,7 +52,10 @@ SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY peker på hoved-AviSafe-prosjektet.
 Kjører i bakgrunnen i mosquitto-maskinen (startes av `entrypoint.sh`):
 
 - Poller `mqtt-broker-credentials` (header `x-broker-secret`) hvert
-  `CRED_SYNC_INTERVAL`. sekund.
+  `CRED_SYNC_INTERVAL` sekund (default 60).
+- Logger ved oppstart om synk er konfigurert (URL, aldri hemmeligheten), og per
+  forsøk: antall sett, brukernavn skrevet til passwd, og HTTP-status ved feil.
+- Er URL/secret ikke satt, logges en `ADVARSEL:`-linje ved hvert forsøk.
 - Skriver `/mosquitto/data/passwd` (bridge-bruker + én bruker per selskapsgruppe)
   og `/mosquitto/data/acl`, der hver bruker kun får publisere på
   `sys/product/{sn}/#` og `thing/product/{sn}/#` for egne/autoriserte serienumre.
