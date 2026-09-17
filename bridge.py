@@ -69,10 +69,13 @@ _stats = {}
 _unresolved_samples = {}
 _stored_once = set()
 _last_stats_at = 0.0
+_no_position_counts = {}
 
 
 def _bump(sn, key):
-    row = _stats.setdefault(sn, {"received": 0, "stored": 0, "dropped": 0, "failed": 0})
+    row = _stats.setdefault(
+        sn, {"received": 0, "stored": 0, "dropped": 0, "failed": 0, "no_position": 0}
+    )
     row[key] += 1
 
 
@@ -88,12 +91,14 @@ def maybe_print_stats():
         return
     for sn, row in _stats.items():
         log.info(
-            "status sn=%s received=%d stored=%d dropped_unknown_sn=%d write_failed=%d",
+            "status sn=%s received=%d stored=%d dropped_unknown_sn=%d "
+            "write_failed=%d no_position=%d",
             sn,
             row["received"],
             row["stored"],
             row["dropped"],
             row["failed"],
+            row["no_position"],
         )
     for sn, sample in _unresolved_samples.items():
         log.warning(
@@ -172,6 +177,18 @@ def note_unresolved(sn):
         )
 
 
+def note_no_position(sn):
+    count = _no_position_counts.get(sn, 0) + 1
+    _no_position_counts[sn] = count
+    if count == 1 or count % 50 == 0:
+        log.warning(
+            "ALERT no_position sn=%s count=%d "
+            "reason=osd_frame_without_latitude_longitude_in_data_or_data_host",
+            sn,
+            count,
+        )
+
+
 def to_iso(value):
     """Translate a DJI OSD timestamp (ms or s epoch) to ISO-8601, else None."""
     if not isinstance(value, (int, float)) or value <= 0:
@@ -215,9 +232,19 @@ def handle_osd(sn_from_topic, payload):
     _bump(sn, "received")
     log.debug("OSD sn=%s payload=%s", sn, json.dumps(payload))
 
-    lat = num(data.get("latitude"))
-    lng = num(data.get("longitude"))
+    # Some OSD frames carry position fields directly under `data`; compact
+    # gateway/host frames instead nest everything under `data.host`. Fall
+    # back to `data.host` whenever `data` itself has no usable coordinates.
+    host = data.get("host")
+    source = data
+    if (data.get("latitude") is None or data.get("longitude") is None) and isinstance(host, dict):
+        source = host
+
+    lat = num(source.get("latitude"))
+    lng = num(source.get("longitude"))
     if lat is None or lng is None:
+        _bump(sn, "no_position")
+        note_no_position(sn)
         log.debug("OSD sn=%s has no position fields, skipping", sn)
         return  # no position in this OSD frame
 
@@ -228,13 +255,13 @@ def handle_osd(sn_from_topic, payload):
             "sn": sn,
             "lat": lat,
             "lng": lng,
-            "height": num(data.get("height")),
-            "battery_percent": num(data.get("capacity_percent")),
+            "height": num(source.get("height")),
+            "battery_percent": num(source.get("capacity_percent")),
         }
         note_unresolved(sn)
         return
 
-    height = num(data.get("height"))
+    height = num(source.get("height"))
     row = {
         "company_id": drone["company_id"],
         "drone_id": drone["drone_id"],
@@ -245,10 +272,10 @@ def handle_osd(sn_from_topic, payload):
         "lat": lat,
         "lng": lng,
         "height_m": height,
-        "altitude_m": num(data.get("elevation")) if num(data.get("elevation")) is not None else num(data.get("altitude")),
-        "vert_speed_ms": num(data.get("vertical_speed")),
-        "ground_speed_ms": num(data.get("horizontal_speed")),
-        "course_deg": num(data.get("attitude_head")),
+        "altitude_m": num(source.get("elevation")) if num(source.get("elevation")) is not None else num(source.get("altitude")),
+        "vert_speed_ms": num(source.get("vertical_speed")),
+        "ground_speed_ms": num(source.get("horizontal_speed")),
+        "course_deg": num(source.get("attitude_head")),
         "raw": payload,
     }
 
